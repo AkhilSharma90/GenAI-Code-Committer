@@ -2,7 +2,7 @@
 
 A smart command-line tool that generates git commit messages using AI. Unlike other similar tools, FastCommit uniquely adapts to your repository's existing commit style, making it perfect for established codebases.
 
-FastCommit understands that a good commit message needs more than just code change summaries - it captures intention, context, and references that help others understand the change better. That's why it provides a simple way to add this additional context.
+FastCommit understands that a good commit message needs more than just code change summaries - it captures intention, context, and references that help others understand the change better. That's why it provides a simple way to add this additional context..
 
 ## Features
 
