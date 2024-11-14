@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -12,17 +14,30 @@ import (
 
 	"al.essio.dev/pkg/shellescape"
 	fastcommit "github.com/AkhilSharma90/GenAI-Code-Committer"
-	"github.com/coder/pretty"
-	"github.com/coder/serpent"
-	"github.com/muesli/termenv"
 	"github.com/sashabaranov/go-openai"
 )
 
-var colorProfile = termenv.ColorProfile()
+// Command line flags
+type flags struct {
+	openAIKey     string
+	openAIBaseURL string
+	model         string
+	saveKey       bool
+	dryRun        bool
+	amend         bool
+	context       arrayFlags
+}
 
-func errorf(format string, args ...any) {
-	c := pretty.FgColor(colorProfile.Color("#ff0000"))
-	pretty.Fprintf(os.Stderr, c, "err: "+format, args...)
+// Custom type to handle multiple --context flags
+type arrayFlags []string
+
+func (i *arrayFlags) String() string {
+	return strings.Join(*i, ",")
+}
+
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
 }
 
 var debugMode = os.Getenv("FASTCOMMIT_DEBUG") != ""
@@ -31,9 +46,11 @@ func debugf(format string, args ...any) {
 	if !debugMode {
 		return
 	}
-	// Gray
-	c := pretty.FgColor(colorProfile.Color("#808080"))
-	pretty.Fprintf(os.Stderr, c, "debug: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "\033[90mdebug: "+format+"\n\033[0m", args...)
+}
+
+func errorf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "\033[31merr: "+format+"\033[0m", args...)
 }
 
 func getLastCommitHash() (string, error) {
@@ -65,8 +82,6 @@ func formatShellCommand(cmd *exec.Cmd) string {
 }
 
 func cleanAIMessage(msg string) string {
-	// As reported by Ben, sometimes GPT returns the message
-	// wrapped in a code block.
 	if strings.HasPrefix(msg, "```") {
 		msg = strings.TrimSuffix(msg, "```")
 		msg = strings.TrimPrefix(msg, "```")
@@ -75,42 +90,42 @@ func cleanAIMessage(msg string) string {
 	return msg
 }
 
-func run(inv *serpent.Invocation, opts runOptions) error {
+func run(f flags, ref string) error {
 	workdir, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
-	if opts.ref != "" && opts.amend {
+	if ref != "" && f.amend {
 		return errors.New("cannot use both [ref] and --amend")
 	}
 
 	hash := ""
-	if opts.amend {
+	if f.amend {
 		lastCommitHash, err := getLastCommitHash()
 		if err != nil {
 			return err
 		}
 		hash = lastCommitHash
-	} else if opts.ref != "" {
-		// Resolve the ref to a hash.
-		hash, err = resolveRef(opts.ref)
+	} else if ref != "" {
+		hash, err = resolveRef(ref)
 		if err != nil {
-			return fmt.Errorf("resolve ref %q: %w", opts.ref, err)
+			return fmt.Errorf("resolve ref %q: %w", ref, err)
 		}
 	}
 
-	msgs, err := fastcommit.BuildPrompt(inv.Stdout, workdir, hash, opts.amend, 128000)
+	msgs, err := fastcommit.BuildPrompt(os.Stdout, workdir, hash, f.amend, 128000)
 	if err != nil {
 		return err
 	}
-	if len(opts.context) > 0 {
+
+	if len(f.context) > 0 {
 		msgs = append(msgs, openai.ChatCompletionMessage{
 			Role: openai.ChatMessageRoleSystem,
 			Content: "The user has provided additional context that MUST be" +
 				" included in the commit message",
 		})
-		for _, context := range opts.context {
+		for _, context := range f.context {
 			msgs = append(msgs, openai.ChatCompletionMessage{
 				Role:    openai.ChatMessageRoleUser,
 				Content: context,
@@ -118,7 +133,6 @@ func run(inv *serpent.Invocation, opts runOptions) error {
 		}
 	}
 
-	ctx := inv.Context()
 	if debugMode {
 		for _, msg := range msgs {
 			debugf("%s: (%v tokens)\n %s\n\n", msg.Role, fastcommit.CountTokens(msg), msg.Content)
@@ -126,26 +140,30 @@ func run(inv *serpent.Invocation, opts runOptions) error {
 		debugf("prompt includes %d commits\n", len(msgs)/2)
 	}
 
-	stream, err := opts.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-		Model:       opts.model,
-		Stream:      true,
-		Temperature: 0,
-		// Seed must not be set for the amend-retry workflow.
-		// Seed:        &seed,
-		StreamOptions: &openai.StreamOptions{
-			IncludeUsage: true,
-		},
-		Messages: msgs,
-	})
+	oaiConfig := openai.DefaultConfig(f.openAIKey)
+	oaiConfig.BaseURL = f.openAIBaseURL
+	client := openai.NewClientWithConfig(oaiConfig)
+
+	// Create context with cancel
+	ctx := context.Background()
+
+	stream, err := client.CreateChatCompletionStream(
+		ctx,
+		openai.ChatCompletionRequest{
+			Model:       f.model,
+			Stream:      true,
+			Temperature: 0,
+			StreamOptions: &openai.StreamOptions{
+				IncludeUsage: true,
+			},
+			Messages: msgs,
+		})
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
 
 	msg := &bytes.Buffer{}
-
-	// Sky blue color
-	color := pretty.FgColor(colorProfile.Color("#2FA8FF"))
 
 	for {
 		resp, err := stream.Recv()
@@ -156,35 +174,33 @@ func run(inv *serpent.Invocation, opts runOptions) error {
 			}
 			return err
 		}
-		// Usage is only sent in the last message.
 		if resp.Usage != nil {
 			debugf("total tokens: %d", resp.Usage.TotalTokens)
 			break
 		}
 		c := resp.Choices[0].Delta.Content
 		msg.WriteString(c)
-		pretty.Fprintf(inv.Stdout, color, "%s", c)
+		fmt.Printf("\033[34m%s\033[0m", c)
 	}
-	inv.Stdout.Write([]byte("\n"))
+	fmt.Println()
 
 	msg = bytes.NewBufferString(cleanAIMessage(msg.String()))
 
 	cmd := exec.Command("git", "commit", "-m", msg.String())
-	if opts.amend {
+	if f.amend {
 		cmd.Args = append(cmd.Args, "--amend")
 	}
 
-	if opts.dryRun {
-		fmt.Fprintf(inv.Stdout, "Run the following command to commit:\n")
-		inv.Stdout.Write([]byte("" + formatShellCommand(cmd) + "\n"))
+	if f.dryRun {
+		fmt.Printf("Run the following command to commit:\n%s\n", formatShellCommand(cmd))
 		return nil
 	}
-	if opts.ref != "" {
+	if ref != "" {
 		debugf("targetting old ref, not committing")
 		return nil
 	}
 
-	inv.Stdout.Write([]byte("\n"))
+	fmt.Println()
 
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
@@ -192,147 +208,68 @@ func run(inv *serpent.Invocation, opts runOptions) error {
 	return cmd.Run()
 }
 
-type runOptions struct {
-	client        *openai.Client
-	openAIBaseURL string
-	model         string
-	dryRun        bool
-	amend         bool
-	ref           string
-	context       []string
-}
-
 func main() {
-	var (
-		opts         runOptions
-		cliOpenAIKey string
-		doSaveKey    bool
-	)
-	cmd := &serpent.Command{
-		Use:   "fastcommit [ref]",
-		Short: "fastcommit is a tool for generating commit messages",
-		Handler: func(inv *serpent.Invocation) error {
-			savedKey, err := loadKey()
-			if err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			var openAIKey string
-			if savedKey != "" && cliOpenAIKey == "" {
-				openAIKey = savedKey
-			} else if cliOpenAIKey != "" {
-				openAIKey = cliOpenAIKey
-			}
+	f := flags{}
 
-			if savedKey != "" && cliOpenAIKey != "" {
-				openAIKeyOpt := inv.Command.Options.ByName("openai-key")
-				if openAIKeyOpt == nil {
-					panic("openai-key option not found")
-				}
-				if openAIKeyOpt.ValueSource == serpent.ValueSourceEnv {
-					openAIKey = savedKey
-				}
-			}
+	flag.StringVar(&f.openAIKey, "openai-key", os.Getenv("OPENAI_API_KEY"), "The OpenAI API key to use")
+	flag.StringVar(&f.openAIBaseURL, "openai-base-url", "https://api.openai.com/v1", "The base URL to use for the OpenAI API")
+	flag.StringVar(&f.model, "model", "gpt-4o-2024-08-06", "The model to use, e.g. gpt-4o or gpt-4o-mini")
+	flag.BoolVar(&f.saveKey, "save-key", false, "Save the OpenAI API key to persistent local configuration and exit")
+	flag.BoolVar(&f.dryRun, "dry", false, "Dry run the command")
+	flag.BoolVar(&f.amend, "amend", false, "Amend the last commit")
+	flag.Var(&f.context, "context", "Extra context beyond the diff to consider when generating the commit message")
 
-			if openAIKey == "" {
-				return errors.New("$OPENAI_API_KEY is not set")
-			}
-
-			if doSaveKey {
-				err := saveKey(cliOpenAIKey)
-				if err != nil {
-					return err
-				}
-
-				kp, err := keyPath()
-				if err != nil {
-					return err
-				}
-
-				fmt.Fprintf(inv.Stdout, "Saved OpenAI API key to %s\n", kp)
-				return nil
-			}
-
-			oaiConfig := openai.DefaultConfig(openAIKey)
-			oaiConfig.BaseURL = opts.openAIBaseURL
-			client := openai.NewClientWithConfig(oaiConfig)
-			opts.client = client
-			if len(inv.Args) > 0 {
-				opts.ref = inv.Args[0]
-			}
-			return run(inv, opts)
-		},
-		Options: []serpent.Option{
-			{
-				Name:        "openai-key",
-				Description: "The OpenAI API key to use.",
-				Env:         "OPENAI_API_KEY",
-				Flag:        "openai-key",
-				Value:       serpent.StringOf(&cliOpenAIKey),
-			},
-			{
-				Name:        "openai-base-url",
-				Description: "The base URL to use for the OpenAI API.",
-				Env:         "OPENAI_BASE_URL",
-				Flag:        "openai-base-url",
-				Value:       serpent.StringOf(&opts.openAIBaseURL),
-				Default:     "https://api.openai.com/v1",
-			},
-			{
-				Name:          "model",
-				Description:   "The model to use, e.g. gpt-4o or gpt-4o-mini.",
-				Flag:          "model",
-				FlagShorthand: "m",
-				Default:       "gpt-4o-2024-08-06",
-				Env:           "FASTCOMMIT_MODEL",
-				Value:         serpent.StringOf(&opts.model),
-			},
-			{
-				Name:        "save-key",
-				Description: "Save the OpenAI API key to persistent local configuration and exit.",
-				Flag:        "save-key",
-				Value:       serpent.BoolOf(&doSaveKey),
-			},
-			{
-				Name:          "dry-run",
-				Flag:          "dry",
-				FlagShorthand: "d",
-				Description:   "Dry run the command.",
-				Value:         serpent.BoolOf(&opts.dryRun),
-			},
-			{
-				Name:          "amend",
-				Flag:          "amend",
-				FlagShorthand: "a",
-				Description:   "Amend the last commit.",
-				Value:         serpent.BoolOf(&opts.amend),
-			},
-			{
-				Name:          "context",
-				Description:   "Extra context beyond the diff to consider when generating the commit message.",
-				Flag:          "context",
-				FlagShorthand: "c",
-				Value:         serpent.StringArrayOf(&opts.context),
-			},
-		},
-		Children: []*serpent.Command{
-			versionCmd(),
-		},
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] [ref]\n", os.Args[0])
+		flag.PrintDefaults()
 	}
 
-	err := cmd.Invoke().WithOS().Run()
-	if err != nil {
-		var unknownCmdErr *serpent.UnknownSubcommandError
-		if errors.As(err, &unknownCmdErr) {
-			// Unknown command is printed by the help function for some reason.
-			os.Exit(1)
-		}
-		var runCommandErr *serpent.RunCommandError
-		if errors.As(err, &runCommandErr) {
-			errorf("%s\n", runCommandErr.Err)
+	flag.Parse()
+
+	if len(os.Args) == 2 && os.Args[1] == "version" {
+		fmt.Printf("fastcommit %s\n", Version)
+		return
+	}
+
+	savedKey, err := loadKey()
+	if err != nil && !os.IsNotExist(err) {
+		errorf("%v\n", err)
+		os.Exit(1)
+	}
+
+	if savedKey != "" && f.openAIKey == os.Getenv("OPENAI_API_KEY") {
+		f.openAIKey = savedKey
+	}
+
+	if f.openAIKey == "" {
+		errorf("$OPENAI_API_KEY is not set\n")
+		os.Exit(1)
+	}
+
+	if f.saveKey {
+		err := saveKey(f.openAIKey)
+		if err != nil {
+			errorf("%v\n", err)
 			os.Exit(1)
 		}
 
-		errorf("%s\n", err)
+		kp, err := keyPath()
+		if err != nil {
+			errorf("%v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Saved OpenAI API key to %s\n", kp)
+		return
+	}
+
+	ref := ""
+	if flag.NArg() > 0 {
+		ref = flag.Arg(0)
+	}
+
+	if err := run(f, ref); err != nil {
+		errorf("%v\n", err)
 		os.Exit(1)
 	}
 }
